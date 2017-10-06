@@ -142,7 +142,7 @@ object JaccardDistancesJob {
         ((w1, w2), z)
       })
 
-    // And get the indices
+    // Join on key and divide the two values to obtain Jaccard distance
     val jaccardDistances = coOccurrenceCountsRdd.
       join(keyedOrCounts).
       map(x => (x._1, x._2._1.toDouble / x._2._2)).
@@ -164,6 +164,7 @@ object JaccardDistancesJob {
         (pair, unionSize)
       })
 
+    // Join on key and divide the two values
     val distribJaccard = coOccurrenceCountsRdd.
       join(distribOrs).
       map(x => (x._1, x._2._1.toDouble / x._2._2)).
@@ -173,13 +174,12 @@ object JaccardDistancesJob {
     jaccardDistances.map(_.toString).saveAsTextFile(s"jac.$outFileNameSuffix")
     distribJaccard.map(_.toString).saveAsTextFile(s"djac.$outFileNameSuffix")
     coOccurrenceCountsRdd.map(_.toString).saveAsTextFile(s"cooc.$outFileNameSuffix")
+
     // Print locally -- for expository purposes
     jaccardDistances.foreach(c => println(s"[OUTPUT]  Pair ${c._1} has Jaccard index ${c._2}"))
     distribJaccard.foreach(c => println(s"[OUTPUT]  Distributed pair ${c._1} has Jaccard index ${c._2}"))
     keyedOrCounts.foreach(c => println(s"[OUTPUT]  OR ${c._1} has value ${c._2}"))
     coOccurrenceCountsRdd.foreach(c => println(s"[OUTPUT]  AND ${c._1} has value ${c._2}"))
-
-    //occurrenceRdd.foreach(x => println(s"Occurrence: $x"))
 
 
   }
