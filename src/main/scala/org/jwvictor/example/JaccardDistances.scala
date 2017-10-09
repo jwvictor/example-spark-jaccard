@@ -105,7 +105,6 @@ object JaccardDistancesJob {
     val inputFileName = "example.txt"
     val outFileNameSuffix = "output.dat" // Suffix of where to write to
     val COALESCE_TO = 8 // This should be selected in some intelligent way based on the infrastructure setup.
-    // I use 8 because it is twice the number of cores allocated on my local setup.
 
     //
     // CORPUS PREPARATION
