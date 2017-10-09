@@ -21,21 +21,14 @@ import org.apache.spark.SparkContext
 /**
   * Jaccard distance example
   *
-  * In this demonstration, I go through two approaches to computing the Jaccard distances of words in a corpus:
+  * This is an example of a clever way to calculate Jaccard distances between words in a corpus in a
+  * highly scalable manner -- implemented here in Spark. The crux of the algorithm relies on the set-
+  * theoretic identity
+  * |X \/ Y| = |X| + |Y| - |X /\ Y|
+  * which computes the union of the sets using only the co-occurrence counts and single word counts.
   *
-  *   1. a variant that broadcasts the source documents, hence assuming that the full corpus can fit on a single node; and
-  *   2. a variant that uses only RDD operations until the final persistence call.
-  *
-  * I am skeptical of whether variant #2 has an advantage over #1 in terms of scalability. Ultimately, I think either
-  * will end up trying to pull the corpus into memory on a single node.
-  *
-  * Notes on liberties I took in this demonstration:
-  *
-  *  - I only calculate the co-occurrences (intersection) data once, using a fully distributed method. In the variant with
-  *    the corpus available as a broadcast variable, one could use various methods to speed up the processing by using
-  *    the data in the broadcast variable. However, this is a tricky question, and one I did not address here.
-  *
-  *  - Long chains of operators are avoided. This is for readability.
+  * Note: the Jaccard distance for two words w1 and w2 is defined as |X /\ Y| / |X \/ Y|, where X and Y
+  * are the number of documents in the corpus containing w1 and w2, respectively.
   *
   */
 object JaccardDistancesJob {
@@ -59,6 +52,17 @@ object JaccardDistancesJob {
     */
   private def getPairKeyFrom(s1: String, s2: String): (String, String) = {
     if (s1 > s2) (s2, s1) else (s1, s2)
+  }
+
+  /**
+    * Is a valid pair key predicate. Used to filter the cartesian product
+    * of word count RDDs.
+    *
+    * @param k a possible co-occurrence key
+    * @return validity
+    */
+  private def isValidPairKey(k: (String, String)): Boolean = {
+    k._1 <= k._2
   }
 
   /**
@@ -98,9 +102,10 @@ object JaccardDistancesJob {
 
     // Session setup
     val sc = new SparkContext
-    val inputFileName = "example.txt" //"README.md"
+    val inputFileName = "example.txt"
     val outFileNameSuffix = "output.dat" // Suffix of where to write to
-    val COALESCE_TO = 32 // This should be selected in some intelligent way based on the infrastructure setup.
+    val COALESCE_TO = 8 // This should be selected in some intelligent way based on the infrastructure setup.
+    // I use 8 because it is twice the number of cores allocated on my local setup.
 
     //
     // CORPUS PREPARATION
@@ -108,78 +113,75 @@ object JaccardDistancesJob {
 
     // Treat each line in file as a "document"
     val cachedText = sc.textFile(inputFileName)
-    val tokenizedText = cachedText.map(tokenizeInputString).cache
+
 
     //
     // FINDING CO-OCCURRENCES (I.E. THE INTERSECTION SIZE)
-    //   (common to both approaches)
     //
 
-    // Get co-occurrences -- i.e. X /\ Y -- the scalable way
-    // (not using broadcast variable for expository purposes).
     val coOccurrenceCountsRdd = cachedText.
       flatMap(getWordCoOccurrences).
       filter(t => nonEmptyKey(t._1)). // Some keys may be invalid
-      coalesce(COALESCE_TO).  // Coalesce after possible uneven filter
-      reduceByKey(_ + _).
-      cache
+      coalesce(COALESCE_TO). // Coalesce after possible uneven filter
+      reduceByKey(_ + _) // Reduce to get keyed numbers of documents with co-occurrences
+
 
     //
-    // APPROACH #1: COLLECT AND BROADCAST TOKENIZED TEXT
-    // COMPUTE UNIONS USING THE BROADCAST VALUE.
+    // FINDING THE WORD COUNTS
     //
 
-    // Broadcast tokenized text to each node for union computation
-    val bcTokenizedText = sc.broadcast(tokenizedText.collect)
+    val occurrenceRdd = cachedText.
+      flatMap(x => tokenizeInputString(x).map(x => (x, 1)).distinct). // Distinct because we want number of documents
+      reduceByKey(_ + _) // Reduce by key to obtain (token, number of documents containing a token) pairs
 
-    // Get the union values -- i.e. X \/ Y -- the less scalable way
-    val distinctPairs = coOccurrenceCountsRdd.map(_._1).cache
-    val keyedOrCounts = distinctPairs.
+
+    //
+    // GETTING THE CARTESIAN OF WORD COUNTS
+    //
+
+    // Get the cartesian product of the occurrences, which we can join against co-occurrences.
+    //
+    // NOTE: cartesian products naturally take a lot of memory, so I filter out invalid keys as quickly as
+    // possible, to avoid extra strain on the subsequent `map` (but mostly `join`) operations. However,
+    // this doesn't filter out _unused_ values, which would be even better, although that seems like it might
+    // not be possible without relying on some kind of intermediate persistence.
+    val occCartesianRdd = occurrenceRdd.
+      cartesian(occurrenceRdd). // Cartesian the RDD against itself
+      filter(x => isValidPairKey((x._1._1, x._2._1))). // Filter invalid keys ASAP
+      map(x => ((x._1._1, x._2._1), (x._1._2, x._2._2))) // Unroll the tuples logically
+
+
+    //
+    // JOINING THE CO-OCCURRENCE COUNTS AGAINST THE CARTESIAN OF COUNTS
+    // TO COMPUTE THE JACCARD DISTANCE
+    //
+
+    // Compute Jaccard distances by joining the co-occurrence counts with the cartesian product of word counts.
+    // Note: out of concern that the hash join could cause some unevenness, I coalesce again, to be on the safe side.
+    val jaccards = coOccurrenceCountsRdd.
+      join(occCartesianRdd).
+      coalesce(COALESCE_TO).
       map(x => {
-        val w1 = x._1
-        val w2 = x._2
-        val z = bcTokenizedText.value.count(doc => doc.contains(w1) || doc.contains(w2))
-        ((w1, w2), z)
+        // The key:
+        val k = x._1
+        // The intersection:
+        val aAndb = x._2._1
+        // The word counts:
+        val ct1 = x._2._2._1
+        val ct2 = x._2._2._2
+        // The union, given by the set-theoretic identity |X \/ Y| = |X| + |Y| - |X /\ Y|
+        val aOrb = ct1 + ct2 - aAndb
+        // Definition of Jaccard distance:
+        val jacc = aAndb.toDouble / aOrb
+        // Make a keyed RDD
+        (k, jacc)
       })
 
-    // Join on key and divide the two values to obtain Jaccard distance
-    val jaccardDistances = coOccurrenceCountsRdd.
-      join(keyedOrCounts).
-      map(x => (x._1, x._2._1.toDouble / x._2._2)).
-      sortByKey(true)
+    // Persist to disk.
+    jaccards.map(_.toString).saveAsTextFile(s"djac.$outFileNameSuffix")
 
-    //
-    // APPROACH #2: MAKE THE WHOLE SPACE AS AN RDD AND USE KEYS TO GROUP THE OR OPERATIONS.
-    //
-
-    // Cartesian the pairs against the documents, group by pairs, and compute the unions over
-    // an iterable of documents.
-    val distribOrs = distinctPairs.
-      cartesian(cachedText).
-      groupByKey.
-      map(pairDocs => {
-        val pair = pairDocs._1
-        val docs = pairDocs._2
-        val unionSize = docs.count(d => d.contains(pair._1) || d.contains(pair._2))
-        (pair, unionSize)
-      })
-
-    // Join on key and divide the two values
-    val distribJaccard = coOccurrenceCountsRdd.
-      join(distribOrs).
-      map(x => (x._1, x._2._1.toDouble / x._2._2)).
-      sortByKey(true)
-
-    // Persist to disk -- for expository purposes
-    jaccardDistances.map(_.toString).saveAsTextFile(s"jac.$outFileNameSuffix")
-    distribJaccard.map(_.toString).saveAsTextFile(s"djac.$outFileNameSuffix")
-    coOccurrenceCountsRdd.map(_.toString).saveAsTextFile(s"cooc.$outFileNameSuffix")
-
-    // Print locally -- for expository purposes
-    jaccardDistances.foreach(c => println(s"[OUTPUT]  Pair ${c._1} has Jaccard index ${c._2}"))
-    distribJaccard.foreach(c => println(s"[OUTPUT]  Distributed pair ${c._1} has Jaccard index ${c._2}"))
-    keyedOrCounts.foreach(c => println(s"[OUTPUT]  OR ${c._1} has value ${c._2}"))
-    coOccurrenceCountsRdd.foreach(c => println(s"[OUTPUT]  AND ${c._1} has value ${c._2}"))
+    // Print locally -- for expository purposes.
+    jaccards.foreach(c => println(s"[OUTPUT]  Distributed pair ${c._1} has Jaccard index ${c._2}"))
 
 
   }
