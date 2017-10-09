@@ -22,9 +22,9 @@ import org.apache.spark.SparkContext
   * Jaccard distance example
   *
   * This is an example of a clever way to calculate Jaccard distances between words in a corpus in a
-  * highly scalable manner -- implemented here in Spark. The crux of the algorithm relies on the set-
+  * highly scalable manner -- implemented here in Spark. The crux of the algorithm is the use of the set-
   * theoretic identity
-  * |X \/ Y| = |X| + |Y| - |X /\ Y|
+  *   |X \/ Y| = |X| + |Y| - |X /\ Y|
   * which computes the union of the sets using only the co-occurrence counts and single word counts.
   *
   * Note: the Jaccard distance for two words w1 and w2 is defined as |X /\ Y| / |X \/ Y|, where X and Y
